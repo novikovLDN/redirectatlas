@@ -5,7 +5,7 @@ import signal
 import time
 from collections import defaultdict
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
 logging.basicConfig(
@@ -30,6 +30,24 @@ def check_rate_limit(bot_id: int, user_id: int) -> bool:
     rate_limits[key].append(now)
     return True
 
+
+# Description shown when user opens the bot chat for the first time (up to 512 chars)
+BOT_DESCRIPTION = (
+    "🔐 Быстрый и надёжный VPN прямо в Telegram!\n"
+    "\n"
+    "✅ Обход любых блокировок и замедлений РКН\n"
+    "✅ Работает при ограничении мобильного интернета\n"
+    "✅ Белые списки — без потери скорости\n"
+    "✅ Выгодная цена\n"
+    "✅ Работает в любой точке мира\n"
+    "\n"
+    "Нажми /start чтобы подключиться 🚀"
+)
+
+# Short description shown in search results and bot profile (up to 120 chars)
+BOT_SHORT_DESCRIPTION = (
+    "🔐 VPN в Telegram — обход блокировок РКН, белые списки, работает по всему миру. Нажми Start!"
+)
 
 MESSAGE_TEXT = (
     "Переходи скорее!\n"
@@ -67,9 +85,11 @@ async def ignore_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     pass
 
 
-def build_app(token: str, referral_link: str) -> Application:
+def build_app(token: str, referral_link: str, bot_desc: str, bot_short_desc: str) -> Application:
     app = Application.builder().token(token).build()
     app.bot_data["referral_link"] = referral_link
+    app.bot_data["description"] = bot_desc
+    app.bot_data["short_description"] = bot_short_desc
     app.add_handler(CommandHandler("start", start_handler))
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, ignore_handler))
     return app
@@ -86,7 +106,9 @@ async def run() -> None:
         if not token:
             continue
         referral_link = os.getenv(f"REFERRAL_LINK_{i}", default_link)
-        app = build_app(token, referral_link)
+        bot_desc = os.getenv(f"BOT_DESCRIPTION_{i}", BOT_DESCRIPTION)
+        bot_short_desc = os.getenv(f"BOT_SHORT_DESCRIPTION_{i}", BOT_SHORT_DESCRIPTION)
+        app = build_app(token, referral_link, bot_desc, bot_short_desc)
         apps.append(app)
         logger.info("Bot %d configured (token ...%s)", i, token[-6:])
 
@@ -97,6 +119,14 @@ async def run() -> None:
     # Initialize and start all bots
     for app in apps:
         await app.initialize()
+
+        # Set bot profile: description, short description, commands menu
+        await app.bot.set_my_description(app.bot_data["description"])
+        await app.bot.set_my_short_description(app.bot_data["short_description"])
+        await app.bot.set_my_commands([
+            BotCommand("start", "🚀 Подключить VPN"),
+        ])
+
         await app.start()
         await app.updater.start_polling(
             allowed_updates=[Update.MESSAGE],
