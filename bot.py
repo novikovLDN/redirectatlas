@@ -1,10 +1,12 @@
 import asyncio
+import hashlib
 import logging
 import os
 import signal
 import time
 from collections import defaultdict
 
+from aiohttp import web
 from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
@@ -86,7 +88,7 @@ async def ignore_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 def build_app(token: str, referral_link: str, bot_desc: str, bot_short_desc: str) -> Application:
-    app = Application.builder().token(token).build()
+    app = Application.builder().token(token).updater(None).build()
     app.bot_data["referral_link"] = referral_link
     app.bot_data["description"] = bot_desc
     app.bot_data["short_description"] = bot_short_desc
@@ -95,12 +97,28 @@ def build_app(token: str, referral_link: str, bot_desc: str, bot_short_desc: str
     return app
 
 
+def webhook_path(token: str) -> str:
+    return "/webhook/" + hashlib.sha256(token.encode()).hexdigest()[:16]
+
+
 async def run() -> None:
+    port = int(os.getenv("PORT", "8080"))
+    domain = os.getenv("RAILWAY_PUBLIC_DOMAIN") or os.getenv("WEBHOOK_DOMAIN")
+
+    if not domain:
+        logger.error(
+            "Set RAILWAY_PUBLIC_DOMAIN or WEBHOOK_DOMAIN env var "
+            "(e.g. myapp.up.railway.app)"
+        )
+        return
+
     default_link = os.getenv(
         "DEFAULT_REFERRAL_LINK", "https://t.me/atlassecure_bot?start=ref_UEGJ3A"
     )
 
-    apps: list[Application] = []
+    # path -> Application
+    apps: dict[str, Application] = {}
+
     for i in range(1, 9):
         token = os.getenv(f"BOT_TOKEN_{i}")
         if not token:
@@ -108,32 +126,61 @@ async def run() -> None:
         referral_link = os.getenv(f"REFERRAL_LINK_{i}", default_link)
         bot_desc = os.getenv(f"BOT_DESCRIPTION_{i}", BOT_DESCRIPTION)
         bot_short_desc = os.getenv(f"BOT_SHORT_DESCRIPTION_{i}", BOT_SHORT_DESCRIPTION)
+
+        path = webhook_path(token)
         app = build_app(token, referral_link, bot_desc, bot_short_desc)
-        apps.append(app)
-        logger.info("Bot %d configured (token ...%s)", i, token[-6:])
+        apps[path] = app
+        logger.info("Bot %d configured -> %s (token ...%s)", i, path, token[-6:])
 
     if not apps:
         logger.error("No bot tokens found. Set BOT_TOKEN_1 .. BOT_TOKEN_8 env vars.")
         return
 
-    # Initialize and start all bots
-    for app in apps:
+    # Initialize bots and register webhooks
+    for path, app in apps.items():
         await app.initialize()
 
-        # Set bot profile: description, short description, commands menu
         await app.bot.set_my_description(app.bot_data["description"])
         await app.bot.set_my_short_description(app.bot_data["short_description"])
         await app.bot.set_my_commands([
             BotCommand("start", "🚀 Подключить VPN"),
         ])
 
-        await app.start()
-        await app.updater.start_polling(
+        webhook_url = f"https://{domain}{path}"
+        await app.bot.set_webhook(
+            url=webhook_url,
             allowed_updates=[Update.MESSAGE],
             drop_pending_updates=True,
         )
+        logger.info("Webhook set: %s", webhook_url)
 
-    logger.info("Started %d bot(s). Waiting for updates...", len(apps))
+        await app.start()
+
+    # --- aiohttp web server ---
+    async def handle_webhook(request: web.Request) -> web.Response:
+        path = request.path
+        app = apps.get(path)
+        if not app:
+            return web.Response(status=404)
+        data = await request.json()
+        update = Update.de_json(data, app.bot)
+        await app.process_update(update)
+        return web.Response(status=200)
+
+    async def handle_health(request: web.Request) -> web.Response:
+        return web.Response(text="ok")
+
+    http_app = web.Application()
+    http_app.router.add_get("/", handle_health)
+    for path in apps:
+        http_app.router.add_post(path, handle_webhook)
+
+    runner = web.AppRunner(http_app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+
+    logger.info("Started %d bot(s) on port %d. Listening for webhooks...", len(apps), port)
 
     # Wait for shutdown signal
     stop_event = asyncio.Event()
@@ -144,10 +191,10 @@ async def run() -> None:
 
     # Graceful shutdown
     logger.info("Shutting down...")
-    for app in apps:
-        await app.updater.stop()
+    for app in apps.values():
         await app.stop()
         await app.shutdown()
+    await runner.cleanup()
 
 
 if __name__ == "__main__":
