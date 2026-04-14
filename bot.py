@@ -119,7 +119,7 @@ async def run() -> None:
     # path -> Application
     apps: dict[str, Application] = {}
 
-    for i in range(1, 12):
+    for i in range(1, 17):
         token = os.getenv(f"BOT_TOKEN_{i}")
         if not token:
             continue
