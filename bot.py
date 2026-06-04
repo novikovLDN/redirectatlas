@@ -137,24 +137,32 @@ async def run() -> None:
         return
 
     # Initialize bots and register webhooks
+    failed_paths: list[str] = []
     for path, app in apps.items():
-        await app.initialize()
+        try:
+            await app.initialize()
 
-        await app.bot.set_my_description(app.bot_data["description"])
-        await app.bot.set_my_short_description(app.bot_data["short_description"])
-        await app.bot.set_my_commands([
-            BotCommand("start", "🚀 Подключить VPN"),
-        ])
+            await app.bot.set_my_description(app.bot_data["description"])
+            await app.bot.set_my_short_description(app.bot_data["short_description"])
+            await app.bot.set_my_commands([
+                BotCommand("start", "🚀 Подключить VPN"),
+            ])
 
-        webhook_url = f"https://{domain}{path}"
-        await app.bot.set_webhook(
-            url=webhook_url,
-            allowed_updates=[Update.MESSAGE],
-            drop_pending_updates=True,
-        )
-        logger.info("Webhook set: %s", webhook_url)
+            webhook_url = f"https://{domain}{path}"
+            await app.bot.set_webhook(
+                url=webhook_url,
+                allowed_updates=[Update.MESSAGE],
+                drop_pending_updates=True,
+            )
+            logger.info("Webhook set: %s", webhook_url)
 
-        await app.start()
+            await app.start()
+        except Exception as exc:
+            logger.error("Bot %s failed to start, skipping: %s", path, exc)
+            failed_paths.append(path)
+
+    for path in failed_paths:
+        del apps[path]
 
     # --- aiohttp web server ---
     async def handle_webhook(request: web.Request) -> web.Response:
