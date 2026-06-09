@@ -3,10 +3,10 @@ import hashlib
 import logging
 import os
 import signal
-import sqlite3
 import time
 from collections import defaultdict
 
+import asyncpg
 from aiohttp import web
 from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
@@ -25,13 +25,15 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-DB_PATH = os.getenv("DB_PATH", "/data/bot.db")
+DATABASE_URL = os.getenv("DATABASE_URL", "")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 
 # Global registry: webhook_path -> Application
 all_apps: dict[str, Application] = {}
 # bot_id -> sequential number (1, 2, 3...)
 bot_numbers: dict[int, int] = {}
+# PostgreSQL connection pool
+db_pool: asyncpg.Pool | None = None
 
 RATE_LIMIT = 10
 RATE_WINDOW = 60
@@ -41,48 +43,58 @@ MENU, BROADCAST_TEXT, BROADCAST_CONFIRM = range(3)
 
 # ── Database ──────────────────────────────────────────────────────────
 
-def init_db() -> None:
-    parent = os.path.dirname(DB_PATH)
-    if parent:
-        os.makedirs(parent, exist_ok=True)
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.execute(
-            "CREATE TABLE IF NOT EXISTS users ("
-            "  bot_id INTEGER NOT NULL,"
-            "  user_id INTEGER NOT NULL,"
-            "  first_seen REAL NOT NULL,"
-            "  PRIMARY KEY (bot_id, user_id)"
-            ")"
+async def init_db() -> None:
+    global db_pool
+    db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=2, max_size=10)
+    async with db_pool.acquire() as conn:
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                bot_id BIGINT NOT NULL,
+                user_id BIGINT NOT NULL,
+                first_seen DOUBLE PRECISION NOT NULL,
+                PRIMARY KEY (bot_id, user_id)
+            )
+        """)
+    logger.info("Database connected and initialized")
+
+
+async def close_db() -> None:
+    if db_pool:
+        await db_pool.close()
+
+
+async def save_user(bot_id: int, user_id: int) -> None:
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO users (bot_id, user_id, first_seen) "
+            "VALUES ($1, $2, $3) "
+            "ON CONFLICT (bot_id, user_id) DO NOTHING",
+            bot_id, user_id, time.time(),
         )
 
 
-def save_user(bot_id: int, user_id: int) -> None:
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.execute(
-            "INSERT OR IGNORE INTO users (bot_id, user_id, first_seen) VALUES (?, ?, ?)",
-            (bot_id, user_id, time.time()),
+async def get_users_for_bot(bot_id: int) -> list[int]:
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT user_id FROM users WHERE bot_id = $1", bot_id
         )
+        return [r["user_id"] for r in rows]
 
 
-def get_users_for_bot(bot_id: int) -> list[int]:
-    with sqlite3.connect(DB_PATH) as conn:
-        return [r[0] for r in conn.execute(
-            "SELECT user_id FROM users WHERE bot_id = ?", (bot_id,)
-        )]
+async def get_stats() -> dict[int, int]:
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT bot_id, COUNT(*) AS cnt FROM users GROUP BY bot_id"
+        )
+        return {r["bot_id"]: r["cnt"] for r in rows}
 
 
-def get_stats() -> dict[int, int]:
-    with sqlite3.connect(DB_PATH) as conn:
-        return dict(conn.execute(
-            "SELECT bot_id, COUNT(*) FROM users GROUP BY bot_id"
-        ).fetchall())
-
-
-def get_total_unique_users() -> int:
-    with sqlite3.connect(DB_PATH) as conn:
-        return conn.execute(
-            "SELECT COUNT(DISTINCT user_id) FROM users"
-        ).fetchone()[0]
+async def get_total_unique_users() -> int:
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT COUNT(DISTINCT user_id) AS cnt FROM users"
+        )
+        return row["cnt"]
 
 
 # ── Rate limiting ─────────────────────────────────────────────────────
@@ -139,7 +151,7 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if not check_rate_limit(bot_id, user_id):
         return
 
-    save_user(bot_id, user_id)
+    await save_user(bot_id, user_id)
 
     referral_link = context.bot_data.get(
         "referral_link", "https://t.me/atlassecure_bot?start=ref_UEGJ3A"
@@ -168,8 +180,7 @@ async def admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if not is_admin(update):
         return ConversationHandler.END
 
-    stats = get_stats()
-    total = get_total_unique_users()
+    total = await get_total_unique_users()
     active_bots = len(all_apps)
 
     keyboard = [
@@ -200,8 +211,8 @@ async def menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         return BROADCAST_TEXT
 
     if query.data == "stats":
-        stats = get_stats()
-        total = get_total_unique_users()
+        stats = await get_stats()
+        total = await get_total_unique_users()
         lines = []
         for bot_id, count in sorted(stats.items(), key=lambda x: bot_numbers.get(x[0], 0)):
             num = bot_numbers.get(bot_id, "?")
@@ -260,7 +271,7 @@ async def broadcast_confirm_cb(update: Update, context: ContextTypes.DEFAULT_TYP
         referral_link = app.bot_data.get(
             "referral_link", "https://t.me/atlassecure_bot?start=ref_UEGJ3A"
         )
-        users = get_users_for_bot(bot_id)
+        users = await get_users_for_bot(bot_id)
         if not users:
             continue
 
@@ -340,7 +351,11 @@ async def run() -> None:
         )
         return
 
-    init_db()
+    if not DATABASE_URL:
+        logger.error("Set DATABASE_URL env var (e.g. postgresql://user:pass@host:5432/db)")
+        return
+
+    await init_db()
 
     default_link = os.getenv(
         "DEFAULT_REFERRAL_LINK", "https://t.me/atlassecure_bot?start=ref_UEGJ3A"
@@ -437,6 +452,7 @@ async def run() -> None:
     for app in all_apps.values():
         await app.stop()
         await app.shutdown()
+    await close_db()
     await runner.cleanup()
 
 
