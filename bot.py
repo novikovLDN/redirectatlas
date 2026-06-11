@@ -32,6 +32,8 @@ ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 all_apps: dict[str, Application] = {}
 # bot_id -> sequential number (1, 2, 3...)
 bot_numbers: dict[int, int] = {}
+# bot_id -> @username from Telegram
+bot_usernames: dict[int, str] = {}
 # PostgreSQL connection pool
 db_pool: asyncpg.Pool | None = None
 
@@ -216,7 +218,8 @@ async def menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         lines = []
         for bot_id, count in sorted(stats.items(), key=lambda x: bot_numbers.get(x[0], 0)):
             num = bot_numbers.get(bot_id, "?")
-            lines.append(f"  Бот #{num}: {count} чел.")
+            name = bot_usernames.get(bot_id, "—")
+            lines.append(f"  #{num} {name}: {count} чел.")
         stats_text = "\n".join(lines) if lines else "  Пока нет данных"
         await query.edit_message_text(
             f"📊 Статистика\n\n"
@@ -402,6 +405,7 @@ async def run() -> None:
             logger.info("Webhook set: %s", webhook_url)
 
             bot_numbers[app.bot.id] = app.bot_data["bot_number"]
+            bot_usernames[app.bot.id] = f"@{app.bot.username}" if app.bot.username else "—"
             await app.start()
         except Exception as exc:
             logger.error("Bot %s failed to start, skipping: %s", path, exc)
