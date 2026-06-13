@@ -47,7 +47,7 @@ MENU, BROADCAST_TEXT, BROADCAST_CONFIRM = range(3)
 
 async def init_db() -> None:
     global db_pool
-    db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=2, max_size=10)
+    db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=5, max_size=20)
     async with db_pool.acquire() as conn:
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS users (
@@ -441,7 +441,7 @@ async def run() -> None:
 
     apps: dict[str, Application] = {}
 
-    for i in range(1, 91):
+    for i in range(1, 301):
         token = os.getenv(f"BOT_TOKEN_{i}")
         if not token:
             continue
@@ -456,20 +456,23 @@ async def run() -> None:
         logger.info("Bot %d configured -> %s (token ...%s)", i, path, token[-6:])
 
     if not apps:
-        logger.error("No bot tokens found. Set BOT_TOKEN_1 .. BOT_TOKEN_90 env vars.")
+        logger.error("No bot tokens found. Set BOT_TOKEN_1 .. BOT_TOKEN_300 env vars.")
         return
 
-    # Initialize bots and register webhooks
-    failed_paths: list[str] = []
-    for path, app in apps.items():
+    # Initialize bots and register webhooks (parallel, batches of 10)
+    INIT_BATCH = 10
+
+    async def init_bot(path: str, app: Application) -> str | None:
         try:
             await app.initialize()
 
-            await app.bot.set_my_description(app.bot_data["description"])
-            await app.bot.set_my_short_description(app.bot_data["short_description"])
-            await app.bot.set_my_commands([
-                BotCommand("start", "🚀 Подключить VPN"),
-            ])
+            await asyncio.gather(
+                app.bot.set_my_description(app.bot_data["description"]),
+                app.bot.set_my_short_description(app.bot_data["short_description"]),
+                app.bot.set_my_commands([
+                    BotCommand("start", "🚀 Подключить VPN"),
+                ]),
+            )
 
             webhook_url = f"https://{domain}{path}"
             await app.bot.set_webhook(
@@ -482,12 +485,20 @@ async def run() -> None:
             bot_numbers[app.bot.id] = app.bot_data["bot_number"]
             bot_usernames[app.bot.id] = f"@{app.bot.username}" if app.bot.username else "—"
             await app.start()
+            return None
         except Exception as exc:
             logger.error("Bot %s failed to start, skipping: %s", path, exc)
-            failed_paths.append(path)
+            return path
 
-    for path in failed_paths:
-        del apps[path]
+    items = list(apps.items())
+    for batch_start in range(0, len(items), INIT_BATCH):
+        batch = items[batch_start : batch_start + INIT_BATCH]
+        results = await asyncio.gather(
+            *(init_bot(path, app) for path, app in batch)
+        )
+        for path in results:
+            if path is not None:
+                del apps[path]
 
     all_apps.update(apps)
 
