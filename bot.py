@@ -140,6 +140,20 @@ MESSAGE_TEXT = (
     "Работает в любой точке мира! 👇"
 )
 
+AUTO_BROADCAST_TEXT = (
+    "🚀 Переезжаем в новый бот\n"
+    "\n"
+    "В новом боте:\n"
+    "\n"
+    "⚡️ Быстрее подключение\n"
+    "🌍 Больше локаций\n"
+    "🔒 Стабильная работа VPN\n"
+    "\n"
+    "👇 Нажмите кнопку и перейдите в новый бот прямо сейчас"
+)
+
+AUTO_BROADCAST_INTERVAL = int(os.getenv("AUTO_BROADCAST_DAYS", "7")) * 86400
+
 
 # ── Handlers ──────────────────────────────────────────────────────────
 
@@ -311,6 +325,67 @@ async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     return ConversationHandler.END
 
 
+# ── Auto broadcast ────────────────────────────────────────────────────
+
+async def auto_broadcast_loop() -> None:
+    await asyncio.sleep(10)
+    while True:
+        try:
+            await run_auto_broadcast()
+        except Exception as exc:
+            logger.error("Auto broadcast error: %s", exc)
+        await asyncio.sleep(AUTO_BROADCAST_INTERVAL)
+
+
+async def run_auto_broadcast() -> None:
+    if not all_apps:
+        return
+
+    total_sent = 0
+    total_failed = 0
+
+    for _path, app in all_apps.items():
+        bot_id = app.bot.id
+        referral_link = app.bot_data.get(
+            "referral_link", "https://t.me/atlassecure_bot?start=ref_UEGJ3A"
+        )
+        users = await get_users_for_bot(bot_id)
+        if not users:
+            continue
+
+        keyboard = [[InlineKeyboardButton("🚀 Подключиться", url=referral_link)]]
+        markup = InlineKeyboardMarkup(keyboard)
+
+        for user_id in users:
+            try:
+                await app.bot.send_message(
+                    chat_id=user_id, text=AUTO_BROADCAST_TEXT, reply_markup=markup
+                )
+                total_sent += 1
+            except Exception:
+                total_failed += 1
+            await asyncio.sleep(0.04)
+
+    logger.info(
+        "Auto broadcast done: sent=%d, failed=%d", total_sent, total_failed
+    )
+
+    if ADMIN_ID:
+        first_app = next(iter(all_apps.values()), None)
+        if first_app:
+            try:
+                await first_app.bot.send_message(
+                    chat_id=ADMIN_ID,
+                    text=(
+                        f"🔄 Авто-рассылка завершена\n\n"
+                        f"📨 Отправлено: {total_sent}\n"
+                        f"❌ Не доставлено: {total_failed}"
+                    ),
+                )
+            except Exception:
+                pass
+
+
 # ── App builder ───────────────────────────────────────────────────────
 
 def build_app(token: str, referral_link: str, bot_desc: str, bot_short_desc: str) -> Application:
@@ -446,6 +521,9 @@ async def run() -> None:
         len(all_apps), port, ADMIN_ID or "not set",
     )
 
+    broadcast_task = asyncio.create_task(auto_broadcast_loop())
+    logger.info("Auto broadcast scheduled every %d days", AUTO_BROADCAST_INTERVAL // 86400)
+
     stop_event = asyncio.Event()
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
@@ -453,6 +531,7 @@ async def run() -> None:
     await stop_event.wait()
 
     logger.info("Shutting down...")
+    broadcast_task.cancel()
     for app in all_apps.values():
         await app.stop()
         await app.shutdown()
