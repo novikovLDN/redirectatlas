@@ -57,6 +57,13 @@ async def init_db() -> None:
                 PRIMARY KEY (bot_id, user_id)
             )
         """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS auto_broadcast_log (
+                id INTEGER PRIMARY KEY DEFAULT 1,
+                last_sent DOUBLE PRECISION NOT NULL,
+                CHECK (id = 1)
+            )
+        """)
     logger.info("Database connected and initialized")
 
 
@@ -97,6 +104,23 @@ async def get_total_unique_users() -> int:
             "SELECT COUNT(DISTINCT user_id) AS cnt FROM users"
         )
         return row["cnt"]
+
+
+async def get_last_auto_broadcast() -> float | None:
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT last_sent FROM auto_broadcast_log WHERE id = 1"
+        )
+        return row["last_sent"] if row else None
+
+
+async def set_last_auto_broadcast(ts: float) -> None:
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO auto_broadcast_log (id, last_sent) VALUES (1, $1) "
+            "ON CONFLICT (id) DO UPDATE SET last_sent = $1",
+            ts,
+        )
 
 
 # ── Rate limiting ─────────────────────────────────────────────────────
@@ -192,12 +216,40 @@ def is_admin(update: Update) -> bool:
     )
 
 
+async def format_auto_broadcast_info() -> str:
+    import datetime
+    last = await get_last_auto_broadcast()
+    days = AUTO_BROADCAST_INTERVAL // 86400
+    if last is None:
+        return f"🔄 Авто-рассылка: каждые {days}д — ещё не отправлялась"
+    last_dt = datetime.datetime.fromtimestamp(last, tz=datetime.timezone.utc)
+    next_ts = last + AUTO_BROADCAST_INTERVAL
+    now = time.time()
+    if next_ts > now:
+        remaining_h = (next_ts - now) / 3600
+        if remaining_h >= 24:
+            remaining_str = f"{remaining_h / 24:.1f}д"
+        else:
+            remaining_str = f"{remaining_h:.1f}ч"
+        return (
+            f"🔄 Авто-рассылка: каждые {days}д\n"
+            f"   Последняя: {last_dt:%d.%m.%Y %H:%M} UTC\n"
+            f"   Следующая через: {remaining_str}"
+        )
+    return (
+        f"🔄 Авто-рассылка: каждые {days}д\n"
+        f"   Последняя: {last_dt:%d.%m.%Y %H:%M} UTC\n"
+        f"   Следующая: скоро"
+    )
+
+
 async def admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if not is_admin(update):
         return ConversationHandler.END
 
     total = await get_total_unique_users()
     active_bots = len(all_apps)
+    auto_info = await format_auto_broadcast_info()
 
     keyboard = [
         [InlineKeyboardButton("📨 Рассылка", callback_data="broadcast")],
@@ -207,7 +259,8 @@ async def admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     await update.message.reply_text(
         f"🔐 Админ-панель\n\n"
         f"🤖 Ботов активно: {active_bots}\n"
-        f"👥 Пользователей всего: {total}",
+        f"👥 Пользователей всего: {total}\n\n"
+        f"{auto_info}",
         reply_markup=InlineKeyboardMarkup(keyboard),
     )
     return MENU
@@ -331,10 +384,24 @@ async def auto_broadcast_loop() -> None:
     await asyncio.sleep(10)
     while True:
         try:
+            last = await get_last_auto_broadcast()
+            now = time.time()
+            if last is not None:
+                elapsed = now - last
+                remaining = AUTO_BROADCAST_INTERVAL - elapsed
+                if remaining > 0:
+                    logger.info(
+                        "Auto broadcast: next in %.1f hours",
+                        remaining / 3600,
+                    )
+                    await asyncio.sleep(remaining)
+                    continue
             await run_auto_broadcast()
+        except asyncio.CancelledError:
+            return
         except Exception as exc:
             logger.error("Auto broadcast error: %s", exc)
-        await asyncio.sleep(AUTO_BROADCAST_INTERVAL)
+            await asyncio.sleep(3600)
 
 
 async def run_auto_broadcast() -> None:
@@ -366,11 +433,18 @@ async def run_auto_broadcast() -> None:
                 total_failed += 1
             await asyncio.sleep(0.04)
 
+    now = time.time()
+    await set_last_auto_broadcast(now)
+
     logger.info(
         "Auto broadcast done: sent=%d, failed=%d", total_sent, total_failed
     )
 
     if ADMIN_ID:
+        import datetime
+        next_dt = datetime.datetime.fromtimestamp(
+            now + AUTO_BROADCAST_INTERVAL, tz=datetime.timezone.utc
+        )
         first_app = next(iter(all_apps.values()), None)
         if first_app:
             try:
@@ -379,7 +453,8 @@ async def run_auto_broadcast() -> None:
                     text=(
                         f"🔄 Авто-рассылка завершена\n\n"
                         f"📨 Отправлено: {total_sent}\n"
-                        f"❌ Не доставлено: {total_failed}"
+                        f"❌ Не доставлено: {total_failed}\n\n"
+                        f"⏭ Следующая: {next_dt:%d.%m.%Y %H:%M} UTC"
                     ),
                 )
             except Exception:
