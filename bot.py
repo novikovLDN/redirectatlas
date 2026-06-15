@@ -1,4 +1,5 @@
 import asyncio
+import datetime
 import hashlib
 import logging
 import os
@@ -26,7 +27,19 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 DATABASE_URL = os.getenv("DATABASE_URL", "")
-ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
+
+
+def parse_admin_ids() -> set[int]:
+    raw = os.getenv("ADMIN_IDS", "") or os.getenv("ADMIN_ID", "")
+    ids = set()
+    for part in raw.split(","):
+        part = part.strip()
+        if part.isdigit():
+            ids.add(int(part))
+    return ids
+
+
+ADMIN_IDS: set[int] = parse_admin_ids()
 
 # Global registry: webhook_path -> Application
 all_apps: dict[str, Application] = {}
@@ -34,6 +47,8 @@ all_apps: dict[str, Application] = {}
 bot_numbers: dict[int, int] = {}
 # bot_id -> @username from Telegram
 bot_usernames: dict[int, str] = {}
+# bot_id -> https://t.me/username link
+bot_links: dict[int, str] = {}
 # PostgreSQL connection pool
 db_pool: asyncpg.Pool | None = None
 
@@ -64,6 +79,10 @@ async def init_db() -> None:
                 CHECK (id = 1)
             )
         """)
+        await conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_users_first_seen "
+            "ON users (bot_id, first_seen)"
+        )
     logger.info("Database connected and initialized")
 
 
@@ -98,12 +117,53 @@ async def get_stats() -> dict[int, int]:
         return {r["bot_id"]: r["cnt"] for r in rows}
 
 
+async def get_detailed_stats() -> dict[int, dict]:
+    now = time.time()
+    day_ago = now - 86400
+    week_ago = now - 604800
+    month_ago = now - 2592000
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT bot_id, "
+            "  COUNT(*) AS total, "
+            "  COUNT(*) FILTER (WHERE first_seen >= $1) AS today, "
+            "  COUNT(*) FILTER (WHERE first_seen >= $2) AS week, "
+            "  COUNT(*) FILTER (WHERE first_seen >= $3) AS month "
+            "FROM users GROUP BY bot_id",
+            day_ago, week_ago, month_ago,
+        )
+        return {
+            r["bot_id"]: {
+                "total": r["total"],
+                "today": r["today"],
+                "week": r["week"],
+                "month": r["month"],
+            }
+            for r in rows
+        }
+
+
 async def get_total_unique_users() -> int:
     async with db_pool.acquire() as conn:
         row = await conn.fetchrow(
             "SELECT COUNT(DISTINCT user_id) AS cnt FROM users"
         )
         return row["cnt"]
+
+
+async def get_total_dynamics() -> dict:
+    now = time.time()
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT "
+            "  COUNT(DISTINCT user_id) AS total, "
+            "  COUNT(DISTINCT user_id) FILTER (WHERE first_seen >= $1) AS today, "
+            "  COUNT(DISTINCT user_id) FILTER (WHERE first_seen >= $2) AS week, "
+            "  COUNT(DISTINCT user_id) FILTER (WHERE first_seen >= $3) AS month "
+            "FROM users",
+            now - 86400, now - 604800, now - 2592000,
+        )
+        return dict(row)
 
 
 async def get_last_auto_broadcast() -> float | None:
@@ -210,14 +270,13 @@ async def ignore_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 def is_admin(update: Update) -> bool:
     return (
-        ADMIN_ID != 0
+        bool(ADMIN_IDS)
         and update.effective_user is not None
-        and update.effective_user.id == ADMIN_ID
+        and update.effective_user.id in ADMIN_IDS
     )
 
 
 async def format_auto_broadcast_info() -> str:
-    import datetime
     last = await get_last_auto_broadcast()
     days = AUTO_BROADCAST_INTERVAL // 86400
     if last is None:
@@ -247,19 +306,22 @@ async def admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if not is_admin(update):
         return ConversationHandler.END
 
-    total = await get_total_unique_users()
+    dyn = await get_total_dynamics()
     active_bots = len(all_apps)
     auto_info = await format_auto_broadcast_info()
 
     keyboard = [
         [InlineKeyboardButton("📨 Рассылка", callback_data="broadcast")],
-        [InlineKeyboardButton("📊 Статистика", callback_data="stats")],
+        [InlineKeyboardButton("📊 Статистика по ботам", callback_data="stats")],
         [InlineKeyboardButton("❌ Закрыть", callback_data="close")],
     ]
     await update.message.reply_text(
         f"🔐 Админ-панель\n\n"
         f"🤖 Ботов активно: {active_bots}\n"
-        f"👥 Пользователей всего: {total}\n\n"
+        f"👥 Всего: {dyn['total']}  |  "
+        f"📅 Сегодня: +{dyn['today']}  |  "
+        f"📆 Неделя: +{dyn['week']}  |  "
+        f"🗓 Месяц: +{dyn['month']}\n\n"
         f"{auto_info}",
         reply_markup=InlineKeyboardMarkup(keyboard),
     )
@@ -280,20 +342,54 @@ async def menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         return BROADCAST_TEXT
 
     if query.data == "stats":
-        stats = await get_stats()
-        total = await get_total_unique_users()
-        lines = []
-        for bot_id, count in sorted(stats.items(), key=lambda x: bot_numbers.get(x[0], 0)):
+        stats = await get_detailed_stats()
+        dyn = await get_total_dynamics()
+
+        header = (
+            f"📊 Статистика по ботам\n\n"
+            f"👥 Уникальных: {dyn['total']}  |  "
+            f"📅 +{dyn['today']}  |  "
+            f"📆 +{dyn['week']}  |  "
+            f"🗓 +{dyn['month']}\n"
+            f"🤖 Активных ботов: {len(all_apps)}\n"
+            f"{'─' * 30}\n"
+        )
+
+        lines: list[str] = []
+        for bot_id, d in sorted(stats.items(), key=lambda x: bot_numbers.get(x[0], 0)):
             num = bot_numbers.get(bot_id, "?")
             name = bot_usernames.get(bot_id, "—")
-            lines.append(f"  #{num} {name}: {count} чел.")
-        stats_text = "\n".join(lines) if lines else "  Пока нет данных"
-        await query.edit_message_text(
-            f"📊 Статистика\n\n"
-            f"{stats_text}\n\n"
-            f"👥 Уникальных пользователей: {total}\n"
-            f"🤖 Активных ботов: {len(all_apps)}"
-        )
+            link = bot_links.get(bot_id, "")
+            growth = ""
+            if d["today"]:
+                growth += f" 📅+{d['today']}"
+            if d["week"]:
+                growth += f" 📆+{d['week']}"
+            lines.append(
+                f"#{num} {name}\n"
+                f"   👥 {d['total']}{growth}\n"
+                f"   🔗 {link}"
+            )
+
+        if not lines:
+            lines.append("Пока нет данных")
+
+        # Split into messages ≤ 4096 chars
+        chunks: list[str] = []
+        current = header
+        for line in lines:
+            entry = line + "\n"
+            if len(current) + len(entry) > 4000:
+                chunks.append(current)
+                current = ""
+            current += entry
+        if current:
+            chunks.append(current)
+
+        await query.edit_message_text(chunks[0])
+        for chunk in chunks[1:]:
+            await query.message.reply_text(chunk)
+
         return ConversationHandler.END
 
     await query.edit_message_text("Админ-панель закрыта.")
@@ -350,7 +446,7 @@ async def broadcast_confirm_cb(update: Update, context: ContextTypes.DEFAULT_TYP
         markup = InlineKeyboardMarkup(keyboard)
 
         for user_id in users:
-            if user_id == ADMIN_ID:
+            if user_id in ADMIN_IDS:
                 continue
             try:
                 await app.bot.send_message(
@@ -440,25 +536,25 @@ async def run_auto_broadcast() -> None:
         "Auto broadcast done: sent=%d, failed=%d", total_sent, total_failed
     )
 
-    if ADMIN_ID:
-        import datetime
+    if ADMIN_IDS:
         next_dt = datetime.datetime.fromtimestamp(
             now + AUTO_BROADCAST_INTERVAL, tz=datetime.timezone.utc
         )
         first_app = next(iter(all_apps.values()), None)
         if first_app:
-            try:
-                await first_app.bot.send_message(
-                    chat_id=ADMIN_ID,
-                    text=(
-                        f"🔄 Авто-рассылка завершена\n\n"
-                        f"📨 Отправлено: {total_sent}\n"
-                        f"❌ Не доставлено: {total_failed}\n\n"
-                        f"⏭ Следующая: {next_dt:%d.%m.%Y %H:%M} UTC"
-                    ),
-                )
-            except Exception:
-                pass
+            for admin_id in ADMIN_IDS:
+                try:
+                    await first_app.bot.send_message(
+                        chat_id=admin_id,
+                        text=(
+                            f"🔄 Авто-рассылка завершена\n\n"
+                            f"📨 Отправлено: {total_sent}\n"
+                            f"❌ Не доставлено: {total_failed}\n\n"
+                            f"⏭ Следующая: {next_dt:%d.%m.%Y %H:%M} UTC"
+                        ),
+                    )
+                except Exception:
+                    pass
 
 
 # ── App builder ───────────────────────────────────────────────────────
@@ -558,7 +654,9 @@ async def run() -> None:
             logger.info("Webhook set: %s", webhook_url)
 
             bot_numbers[app.bot.id] = app.bot_data["bot_number"]
-            bot_usernames[app.bot.id] = f"@{app.bot.username}" if app.bot.username else "—"
+            username = app.bot.username or ""
+            bot_usernames[app.bot.id] = f"@{username}" if username else "—"
+            bot_links[app.bot.id] = f"https://t.me/{username}" if username else "—"
             await app.start()
             return None
         except Exception as exc:
@@ -603,8 +701,8 @@ async def run() -> None:
     await site.start()
 
     logger.info(
-        "Started %d bot(s) on port %d. Admin ID: %s",
-        len(all_apps), port, ADMIN_ID or "not set",
+        "Started %d bot(s) on port %d. Admins: %s",
+        len(all_apps), port, ADMIN_IDS or "not set",
     )
 
     broadcast_task = asyncio.create_task(auto_broadcast_loop())
