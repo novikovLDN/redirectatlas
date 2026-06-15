@@ -41,22 +41,24 @@ def parse_admin_ids() -> set[int]:
 
 ADMIN_IDS: set[int] = parse_admin_ids()
 
-# Global registry: webhook_path -> Application
 all_apps: dict[str, Application] = {}
-# bot_id -> sequential number (1, 2, 3...)
 bot_numbers: dict[int, int] = {}
-# bot_id -> @username from Telegram
 bot_usernames: dict[int, str] = {}
-# bot_id -> https://t.me/username link
 bot_links: dict[int, str] = {}
-# PostgreSQL connection pool
 db_pool: asyncpg.Pool | None = None
 
 RATE_LIMIT = 10
 RATE_WINDOW = 60
 rate_limits: dict[tuple[int, int], list[float]] = defaultdict(list)
 
-MENU, BROADCAST_TEXT, BROADCAST_CONFIRM = range(3)
+(
+    MENU,
+    BC_TEXT,
+    BC_PHOTO,
+    BC_BTN_TEXT,
+    BC_BTN_URL,
+    BC_CONFIRM,
+) = range(6)
 
 # ── Database ──────────────────────────────────────────────────────────
 
@@ -109,19 +111,8 @@ async def get_users_for_bot(bot_id: int) -> list[int]:
         return [r["user_id"] for r in rows]
 
 
-async def get_stats() -> dict[int, int]:
-    async with db_pool.acquire() as conn:
-        rows = await conn.fetch(
-            "SELECT bot_id, COUNT(*) AS cnt FROM users GROUP BY bot_id"
-        )
-        return {r["bot_id"]: r["cnt"] for r in rows}
-
-
 async def get_detailed_stats() -> dict[int, dict]:
     now = time.time()
-    day_ago = now - 86400
-    week_ago = now - 604800
-    month_ago = now - 2592000
     async with db_pool.acquire() as conn:
         rows = await conn.fetch(
             "SELECT bot_id, "
@@ -130,7 +121,7 @@ async def get_detailed_stats() -> dict[int, dict]:
             "  COUNT(*) FILTER (WHERE first_seen >= $2) AS week, "
             "  COUNT(*) FILTER (WHERE first_seen >= $3) AS month "
             "FROM users GROUP BY bot_id",
-            day_ago, week_ago, month_ago,
+            now - 86400, now - 604800, now - 2592000,
         )
         return {
             r["bot_id"]: {
@@ -141,14 +132,6 @@ async def get_detailed_stats() -> dict[int, dict]:
             }
             for r in rows
         }
-
-
-async def get_total_unique_users() -> int:
-    async with db_pool.acquire() as conn:
-        row = await conn.fetchrow(
-            "SELECT COUNT(DISTINCT user_id) AS cnt FROM users"
-        )
-        return row["cnt"]
 
 
 async def get_total_dynamics() -> dict:
@@ -244,15 +227,11 @@ AUTO_BROADCAST_INTERVAL = int(os.getenv("AUTO_BROADCAST_DAYS", "7")) * 86400
 async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message or not update.effective_user:
         return
-
     bot_id = context.bot.id
     user_id = update.effective_user.id
-
     if not check_rate_limit(bot_id, user_id):
         return
-
     await save_user(bot_id, user_id)
-
     referral_link = context.bot_data.get(
         "referral_link", "https://t.me/atlassecure_bot?start=ref_UEGJ3A"
     )
@@ -266,7 +245,7 @@ async def ignore_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     pass
 
 
-# ── Admin handlers ────────────────────────────────────────────────────
+# ── Admin ─────────────────────────────────────────────────────────────
 
 def is_admin(update: Update) -> bool:
     return (
@@ -274,6 +253,11 @@ def is_admin(update: Update) -> bool:
         and update.effective_user is not None
         and update.effective_user.id in ADMIN_IDS
     )
+
+
+def clear_bc(context: ContextTypes.DEFAULT_TYPE) -> None:
+    for k in ("bc_text", "bc_photo", "bc_btn_text", "bc_btn_url"):
+        context.user_data.pop(k, None)
 
 
 async def format_auto_broadcast_info() -> str:
@@ -286,10 +270,9 @@ async def format_auto_broadcast_info() -> str:
     now = time.time()
     if next_ts > now:
         remaining_h = (next_ts - now) / 3600
-        if remaining_h >= 24:
-            remaining_str = f"{remaining_h / 24:.1f}д"
-        else:
-            remaining_str = f"{remaining_h:.1f}ч"
+        remaining_str = (
+            f"{remaining_h / 24:.1f}д" if remaining_h >= 24 else f"{remaining_h:.1f}ч"
+        )
         return (
             f"🔄 Авто-рассылка: каждые {days}д\n"
             f"   Последняя: {last_dt:%d.%m.%Y %H:%M} UTC\n"
@@ -302,49 +285,50 @@ async def format_auto_broadcast_info() -> str:
     )
 
 
+# ── /admin entry ──
+
 async def admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if not is_admin(update):
         return ConversationHandler.END
-
+    clear_bc(context)
     dyn = await get_total_dynamics()
-    active_bots = len(all_apps)
     auto_info = await format_auto_broadcast_info()
-
     keyboard = [
         [InlineKeyboardButton("📨 Рассылка", callback_data="broadcast")],
-        [InlineKeyboardButton("📊 Статистика по ботам", callback_data="stats")],
+        [InlineKeyboardButton("📊 Статистика", callback_data="stats")],
         [InlineKeyboardButton("❌ Закрыть", callback_data="close")],
     ]
     await update.message.reply_text(
         f"🔐 Админ-панель\n\n"
-        f"🤖 Ботов активно: {active_bots}\n"
+        f"🤖 Ботов: {len(all_apps)}\n"
         f"👥 Всего: {dyn['total']}  |  "
-        f"📅 Сегодня: +{dyn['today']}  |  "
-        f"📆 Неделя: +{dyn['week']}  |  "
-        f"🗓 Месяц: +{dyn['month']}\n\n"
+        f"📅 +{dyn['today']}  |  "
+        f"📆 +{dyn['week']}  |  "
+        f"🗓 +{dyn['month']}\n\n"
         f"{auto_info}",
         reply_markup=InlineKeyboardMarkup(keyboard),
     )
     return MENU
 
 
+# ── MENU ──
+
 async def menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
 
     if query.data == "broadcast":
+        clear_bc(context)
         await query.edit_message_text(
-            "📨 Отправьте текст рассылки:\n\n"
-            "Каждый бот отправит это сообщение своим пользователям "
-            "с кнопкой «Подключить VPN».\n\n"
+            "📨 Шаг 1/4 — Текст\n\n"
+            "Отправьте текст рассылки.\n"
             "/cancel — отмена"
         )
-        return BROADCAST_TEXT
+        return BC_TEXT
 
     if query.data == "stats":
         stats = await get_detailed_stats()
         dyn = await get_total_dynamics()
-
         header = (
             f"📊 Статистика по ботам\n\n"
             f"👥 Уникальных: {dyn['total']}  |  "
@@ -354,9 +338,10 @@ async def menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
             f"🤖 Активных ботов: {len(all_apps)}\n"
             f"{'─' * 30}\n"
         )
-
         lines: list[str] = []
-        for bot_id, d in sorted(stats.items(), key=lambda x: bot_numbers.get(x[0], 0)):
+        for bot_id, d in sorted(
+            stats.items(), key=lambda x: bot_numbers.get(x[0], 0)
+        ):
             num = bot_numbers.get(bot_id, "?")
             name = bot_usernames.get(bot_id, "—")
             link = bot_links.get(bot_id, "")
@@ -370,11 +355,8 @@ async def menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
                 f"   👥 {d['total']}{growth}\n"
                 f"   🔗 {link}"
             )
-
         if not lines:
             lines.append("Пока нет данных")
-
-        # Split into messages ≤ 4096 chars
         chunks: list[str] = []
         current = header
         for line in lines:
@@ -385,43 +367,136 @@ async def menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
             current += entry
         if current:
             chunks.append(current)
-
         await query.edit_message_text(chunks[0])
         for chunk in chunks[1:]:
             await query.message.reply_text(chunk)
-
         return ConversationHandler.END
 
     await query.edit_message_text("Админ-панель закрыта.")
     return ConversationHandler.END
 
 
-async def broadcast_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    context.user_data["broadcast_text"] = update.message.text
+# ── BC_TEXT ──
+
+async def bc_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data["bc_text"] = update.message.text
+    keyboard = [[InlineKeyboardButton("⏭ Пропустить", callback_data="skip_photo")]]
+    await update.message.reply_text(
+        "📨 Шаг 2/4 — Фото\n\n"
+        "Отправьте фото или нажмите «Пропустить».",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+    return BC_PHOTO
+
+
+# ── BC_PHOTO ──
+
+async def bc_photo_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data["bc_photo"] = update.message.photo[-1].file_id
+    keyboard = [[InlineKeyboardButton("⏭ Пропустить", callback_data="skip_btn")]]
+    await update.message.reply_text(
+        "📨 Шаг 3/4 — Кнопка\n\n"
+        "Введите текст кнопки (например: Забрать скидку, Подключиться, Перейти)\n"
+        "или нажмите «Пропустить» для кнопки по умолчанию.",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+    return BC_BTN_TEXT
+
+
+async def bc_photo_skip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    context.user_data["bc_photo"] = None
+    keyboard = [[InlineKeyboardButton("⏭ Пропустить", callback_data="skip_btn")]]
+    await query.edit_message_text(
+        "📨 Шаг 3/4 — Кнопка\n\n"
+        "Введите текст кнопки (например: Забрать скидку, Подключиться, Перейти)\n"
+        "или нажмите «Пропустить» для кнопки по умолчанию.",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+    return BC_BTN_TEXT
+
+
+# ── BC_BTN_TEXT ──
+
+async def bc_btn_text_handler(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> int:
+    context.user_data["bc_btn_text"] = update.message.text
+    await update.message.reply_text(
+        "📨 Шаг 4/4 — URL кнопки\n\n"
+        "Отправьте ссылку для кнопки.\n"
+        "Или отправьте «реф» — будет использована реф-ссылка бота."
+    )
+    return BC_BTN_URL
+
+
+async def bc_btn_skip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    context.user_data["bc_btn_text"] = None
+    context.user_data["bc_btn_url"] = None
+    return await show_preview(query.message.chat_id, context)
+
+
+# ── BC_BTN_URL ──
+
+async def bc_btn_url_handler(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> int:
+    url = update.message.text.strip()
+    if url.lower() == "реф":
+        context.user_data["bc_btn_url"] = None
+    else:
+        context.user_data["bc_btn_url"] = url
+    return await show_preview(update.message.chat_id, context)
+
+
+async def show_preview(chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> int:
+    ud = context.user_data
+    text = ud.get("bc_text", "")
+    photo = ud.get("bc_photo")
+    btn_text = ud.get("bc_btn_text")
+    btn_url = ud.get("bc_btn_url")
+
+    preview_parts = [f"📨 Предпросмотр рассылки:\n"]
+    preview_parts.append(f"📝 Текст: {text[:200]}{'…' if len(text) > 200 else ''}")
+    preview_parts.append(f"🖼 Фото: {'Да' if photo else 'Нет'}")
+    if btn_text:
+        url_display = btn_url or "реф-ссылка бота"
+        preview_parts.append(f"🔘 Кнопка: «{btn_text}» → {url_display}")
+    else:
+        preview_parts.append("🔘 Кнопка: «🚀 Подключить VPN» → реф-ссылка бота")
 
     keyboard = [
         [InlineKeyboardButton("✅ Отправить всем", callback_data="confirm")],
         [InlineKeyboardButton("❌ Отмена", callback_data="cancel")],
     ]
-    await update.message.reply_text(
-        f"📨 Предпросмотр:\n\n"
-        f"{update.message.text}\n\n"
-        f"[+ кнопка «🚀 Подключить VPN»]\n\n"
-        f"Отправить всем пользователям всех ботов?",
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text="\n".join(preview_parts),
         reply_markup=InlineKeyboardMarkup(keyboard),
     )
-    return BROADCAST_CONFIRM
+    return BC_CONFIRM
 
 
-async def broadcast_confirm_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+# ── BC_CONFIRM ──
+
+async def bc_confirm_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
 
     if query.data == "cancel":
         await query.edit_message_text("❌ Рассылка отменена.")
+        clear_bc(context)
         return ConversationHandler.END
 
-    text = context.user_data.get("broadcast_text", "")
+    ud = context.user_data
+    text = ud.get("bc_text", "")
+    photo = ud.get("bc_photo")
+    btn_text = ud.get("bc_btn_text")
+    btn_url = ud.get("bc_btn_url")
+
     if not text:
         await query.edit_message_text("❌ Текст рассылки не найден.")
         return ConversationHandler.END
@@ -442,16 +517,27 @@ async def broadcast_confirm_cb(update: Update, context: ContextTypes.DEFAULT_TYP
             continue
 
         bots_used += 1
-        keyboard = [[InlineKeyboardButton("🚀 Подключить VPN", url=referral_link)]]
+
+        final_url = btn_url or referral_link
+        final_btn_text = btn_text or "🚀 Подключить VPN"
+        keyboard = [[InlineKeyboardButton(final_btn_text, url=final_url)]]
         markup = InlineKeyboardMarkup(keyboard)
 
         for user_id in users:
             if user_id in ADMIN_IDS:
                 continue
             try:
-                await app.bot.send_message(
-                    chat_id=user_id, text=text, reply_markup=markup
-                )
+                if photo:
+                    await app.bot.send_photo(
+                        chat_id=user_id,
+                        photo=photo,
+                        caption=text,
+                        reply_markup=markup,
+                    )
+                else:
+                    await app.bot.send_message(
+                        chat_id=user_id, text=text, reply_markup=markup
+                    )
                 total_sent += 1
             except Exception:
                 total_failed += 1
@@ -463,13 +549,15 @@ async def broadcast_confirm_cb(update: Update, context: ContextTypes.DEFAULT_TYP
             f"✅ Рассылка завершена!\n\n"
             f"📨 Отправлено: {total_sent}\n"
             f"❌ Не доставлено: {total_failed}\n"
-            f"🤖 Ботов задействовано: {bots_used}"
+            f"🤖 Ботов: {bots_used}"
         ),
     )
+    clear_bc(context)
     return ConversationHandler.END
 
 
 async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    clear_bc(context)
     await update.message.reply_text("Отменено.")
     return ConversationHandler.END
 
@@ -483,12 +571,10 @@ async def auto_broadcast_loop() -> None:
             last = await get_last_auto_broadcast()
             now = time.time()
             if last is not None:
-                elapsed = now - last
-                remaining = AUTO_BROADCAST_INTERVAL - elapsed
+                remaining = AUTO_BROADCAST_INTERVAL - (now - last)
                 if remaining > 0:
                     logger.info(
-                        "Auto broadcast: next in %.1f hours",
-                        remaining / 3600,
+                        "Auto broadcast: next in %.1f hours", remaining / 3600
                     )
                     await asyncio.sleep(remaining)
                     continue
@@ -503,10 +589,8 @@ async def auto_broadcast_loop() -> None:
 async def run_auto_broadcast() -> None:
     if not all_apps:
         return
-
     total_sent = 0
     total_failed = 0
-
     for _path, app in all_apps.items():
         bot_id = app.bot.id
         referral_link = app.bot_data.get(
@@ -515,10 +599,8 @@ async def run_auto_broadcast() -> None:
         users = await get_users_for_bot(bot_id)
         if not users:
             continue
-
         keyboard = [[InlineKeyboardButton("🚀 Подключиться", url=referral_link)]]
         markup = InlineKeyboardMarkup(keyboard)
-
         for user_id in users:
             try:
                 await app.bot.send_message(
@@ -528,14 +610,9 @@ async def run_auto_broadcast() -> None:
             except Exception:
                 total_failed += 1
             await asyncio.sleep(0.04)
-
     now = time.time()
     await set_last_auto_broadcast(now)
-
-    logger.info(
-        "Auto broadcast done: sent=%d, failed=%d", total_sent, total_failed
-    )
-
+    logger.info("Auto broadcast done: sent=%d, failed=%d", total_sent, total_failed)
     if ADMIN_IDS:
         next_dt = datetime.datetime.fromtimestamp(
             now + AUTO_BROADCAST_INTERVAL, tz=datetime.timezone.utc
@@ -559,7 +636,9 @@ async def run_auto_broadcast() -> None:
 
 # ── App builder ───────────────────────────────────────────────────────
 
-def build_app(token: str, referral_link: str, bot_desc: str, bot_short_desc: str) -> Application:
+def build_app(
+    token: str, referral_link: str, bot_desc: str, bot_short_desc: str
+) -> Application:
     app = Application.builder().token(token).updater(None).build()
     app.bot_data["referral_link"] = referral_link
     app.bot_data["description"] = bot_desc
@@ -569,10 +648,21 @@ def build_app(token: str, referral_link: str, bot_desc: str, bot_short_desc: str
         entry_points=[CommandHandler("admin", admin_cmd)],
         states={
             MENU: [CallbackQueryHandler(menu_cb)],
-            BROADCAST_TEXT: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, broadcast_text),
+            BC_TEXT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, bc_text_handler),
             ],
-            BROADCAST_CONFIRM: [CallbackQueryHandler(broadcast_confirm_cb)],
+            BC_PHOTO: [
+                MessageHandler(filters.PHOTO, bc_photo_received),
+                CallbackQueryHandler(bc_photo_skip, pattern=r"^skip_photo$"),
+            ],
+            BC_BTN_TEXT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, bc_btn_text_handler),
+                CallbackQueryHandler(bc_btn_skip, pattern=r"^skip_btn$"),
+            ],
+            BC_BTN_URL: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, bc_btn_url_handler),
+            ],
+            BC_CONFIRM: [CallbackQueryHandler(bc_confirm_cb)],
         },
         fallbacks=[CommandHandler("cancel", cancel_cmd)],
     )
@@ -601,7 +691,7 @@ async def run() -> None:
         return
 
     if not DATABASE_URL:
-        logger.error("Set DATABASE_URL env var (e.g. postgresql://user:pass@host:5432/db)")
+        logger.error("Set DATABASE_URL env var")
         return
 
     await init_db()
@@ -630,13 +720,11 @@ async def run() -> None:
         logger.error("No bot tokens found. Set BOT_TOKEN_1 .. BOT_TOKEN_300 env vars.")
         return
 
-    # Initialize bots and register webhooks (parallel, batches of 10)
     INIT_BATCH = 10
 
     async def init_bot(path: str, app: Application) -> str | None:
         try:
             await app.initialize()
-
             await asyncio.gather(
                 app.bot.set_my_description(app.bot_data["description"]),
                 app.bot.set_my_short_description(app.bot_data["short_description"]),
@@ -644,7 +732,6 @@ async def run() -> None:
                     BotCommand("start", "🚀 Подключить VPN"),
                 ]),
             )
-
             webhook_url = f"https://{domain}{path}"
             await app.bot.set_webhook(
                 url=webhook_url,
@@ -652,7 +739,6 @@ async def run() -> None:
                 drop_pending_updates=True,
             )
             logger.info("Webhook set: %s", webhook_url)
-
             bot_numbers[app.bot.id] = app.bot_data["bot_number"]
             username = app.bot.username or ""
             bot_usernames[app.bot.id] = f"@{username}" if username else "—"
@@ -667,19 +753,17 @@ async def run() -> None:
     for batch_start in range(0, len(items), INIT_BATCH):
         batch = items[batch_start : batch_start + INIT_BATCH]
         results = await asyncio.gather(
-            *(init_bot(path, app) for path, app in batch)
+            *(init_bot(p, a) for p, a in batch)
         )
-        for path in results:
-            if path is not None:
-                del apps[path]
+        for p in results:
+            if p is not None:
+                del apps[p]
 
     all_apps.update(apps)
 
-    # ── aiohttp web server ──
-
     async def handle_webhook(request: web.Request) -> web.Response:
-        path = request.path
-        app = all_apps.get(path)
+        p = request.path
+        app = all_apps.get(p)
         if not app:
             return web.Response(status=404)
         data = await request.json()
@@ -706,7 +790,9 @@ async def run() -> None:
     )
 
     broadcast_task = asyncio.create_task(auto_broadcast_loop())
-    logger.info("Auto broadcast scheduled every %d days", AUTO_BROADCAST_INTERVAL // 86400)
+    logger.info(
+        "Auto broadcast scheduled every %d days", AUTO_BROADCAST_INTERVAL // 86400
+    )
 
     stop_event = asyncio.Event()
     loop = asyncio.get_running_loop()
