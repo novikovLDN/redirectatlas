@@ -231,7 +231,10 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     user_id = update.effective_user.id
     if not check_rate_limit(bot_id, user_id):
         return
-    await save_user(bot_id, user_id)
+    try:
+        await save_user(bot_id, user_id)
+    except Exception:
+        logger.exception("DB error saving user %d for bot %d", user_id, bot_id)
     referral_link = context.bot_data.get(
         "referral_link", "https://t.me/atlassecure_bot?start=ref_UEGJ3A"
     )
@@ -766,9 +769,12 @@ async def run() -> None:
         app = all_apps.get(p)
         if not app:
             return web.Response(status=404)
-        data = await request.json()
-        update = Update.de_json(data, app.bot)
-        await app.process_update(update)
+        try:
+            data = await request.json()
+            update = Update.de_json(data, app.bot)
+            await app.process_update(update)
+        except Exception:
+            logger.exception("Error processing update for %s", p)
         return web.Response(status=200)
 
     async def handle_health(request: web.Request) -> web.Response:
