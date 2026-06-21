@@ -46,6 +46,8 @@ bot_numbers: dict[int, int] = {}
 bot_usernames: dict[int, str] = {}
 bot_links: dict[int, str] = {}
 db_pool: asyncpg.Pool | None = None
+webhook_domain: str = ""
+next_bot_number: int = 1
 
 RATE_LIMIT = 10
 RATE_WINDOW = 60
@@ -58,7 +60,8 @@ rate_limits: dict[tuple[int, int], list[float]] = defaultdict(list)
     BC_BTN_TEXT,
     BC_BTN_URL,
     BC_CONFIRM,
-) = range(6)
+    ADD_BOT_TOKEN,
+) = range(7)
 
 # ── Database ──────────────────────────────────────────────────────────
 
@@ -79,6 +82,13 @@ async def init_db() -> None:
                 id INTEGER PRIMARY KEY DEFAULT 1,
                 last_sent DOUBLE PRECISION NOT NULL,
                 CHECK (id = 1)
+            )
+        """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS bot_tokens (
+                token TEXT PRIMARY KEY,
+                referral_link TEXT,
+                added_at DOUBLE PRECISION NOT NULL
             )
         """)
         await conn.execute(
@@ -164,6 +174,26 @@ async def set_last_auto_broadcast(ts: float) -> None:
             "ON CONFLICT (id) DO UPDATE SET last_sent = $1",
             ts,
         )
+
+
+async def save_bot_token(token: str, referral_link: str | None) -> None:
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO bot_tokens (token, referral_link, added_at) "
+            "VALUES ($1, $2, $3) ON CONFLICT (token) DO NOTHING",
+            token, referral_link, time.time(),
+        )
+
+
+async def get_db_bot_tokens() -> list[dict]:
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch("SELECT token, referral_link FROM bot_tokens")
+        return [dict(r) for r in rows]
+
+
+async def delete_bot_token(token: str) -> None:
+    async with db_pool.acquire() as conn:
+        await conn.execute("DELETE FROM bot_tokens WHERE token = $1", token)
 
 
 # ── Rate limiting ─────────────────────────────────────────────────────
@@ -288,8 +318,6 @@ async def format_auto_broadcast_info() -> str:
     )
 
 
-# ── /admin entry ──
-
 async def admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if not is_admin(update):
         return ConversationHandler.END
@@ -299,6 +327,7 @@ async def admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     keyboard = [
         [InlineKeyboardButton("📨 Рассылка", callback_data="broadcast")],
         [InlineKeyboardButton("📊 Статистика", callback_data="stats")],
+        [InlineKeyboardButton("➕ Добавить бота", callback_data="add_bot")],
         [InlineKeyboardButton("❌ Закрыть", callback_data="close")],
     ]
     await update.message.reply_text(
@@ -314,8 +343,6 @@ async def admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     return MENU
 
 
-# ── MENU ──
-
 async def menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
@@ -328,6 +355,15 @@ async def menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
             "/cancel — отмена"
         )
         return BC_TEXT
+
+    if query.data == "add_bot":
+        await query.edit_message_text(
+            "➕ Добавить бота\n\n"
+            "Отправьте токен бота (получить в @BotFather).\n"
+            "Формат: 123456789:ABCDEF...\n\n"
+            "/cancel — отмена"
+        )
+        return ADD_BOT_TOKEN
 
     if query.data == "stats":
         stats = await get_detailed_stats()
@@ -379,7 +415,84 @@ async def menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     return ConversationHandler.END
 
 
-# ── BC_TEXT ──
+# ── ADD_BOT_TOKEN ──
+
+async def add_bot_token_handler(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> int:
+    global next_bot_number
+    token = update.message.text.strip()
+
+    if ":" not in token:
+        await update.message.reply_text(
+            "❌ Неверный формат токена. Попробуйте ещё раз или /cancel"
+        )
+        return ADD_BOT_TOKEN
+
+    path = webhook_path(token)
+    if path in all_apps:
+        await update.message.reply_text("⚠️ Этот бот уже добавлен и активен.")
+        return ConversationHandler.END
+
+    await update.message.reply_text("⏳ Проверяю токен...")
+
+    default_link = os.getenv(
+        "DEFAULT_REFERRAL_LINK", "https://t.me/atlassecure_bot?start=ref_UEGJ3A"
+    )
+
+    try:
+        app = build_app(token, default_link, BOT_DESCRIPTION, BOT_SHORT_DESCRIPTION)
+        await app.initialize()
+
+        await asyncio.gather(
+            app.bot.set_my_description(BOT_DESCRIPTION),
+            app.bot.set_my_short_description(BOT_SHORT_DESCRIPTION),
+            app.bot.set_my_commands([
+                BotCommand("start", "🚀 Подключить VPN"),
+            ]),
+        )
+
+        wh_url = f"https://{webhook_domain}{path}"
+        await app.bot.set_webhook(
+            url=wh_url,
+            allowed_updates=["message", "callback_query"],
+            drop_pending_updates=True,
+        )
+
+        num = next_bot_number
+        next_bot_number += 1
+        app.bot_data["bot_number"] = num
+
+        bot_numbers[app.bot.id] = num
+        username = app.bot.username or ""
+        bot_usernames[app.bot.id] = f"@{username}" if username else "—"
+        bot_links[app.bot.id] = f"https://t.me/{username}" if username else "—"
+
+        await app.start()
+        all_apps[path] = app
+
+        await save_bot_token(token, default_link)
+
+        logger.info("Bot %d hot-added: @%s", num, username)
+
+        await update.message.reply_text(
+            f"✅ Бот добавлен и запущен!\n\n"
+            f"🤖 #{num} @{username}\n"
+            f"🔗 https://t.me/{username}\n\n"
+            f"Бот сохранён в БД — переживёт редеплой."
+        )
+    except Exception as exc:
+        logger.error("Failed to add bot: %s", exc)
+        await update.message.reply_text(
+            f"❌ Не удалось запустить бота:\n{exc}\n\n"
+            f"Проверьте токен и попробуйте ещё раз или /cancel"
+        )
+        return ADD_BOT_TOKEN
+
+    return ConversationHandler.END
+
+
+# ── Broadcast steps ──────────────────────────────────────────────────
 
 async def bc_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data["bc_text"] = update.message.text
@@ -391,8 +504,6 @@ async def bc_text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     )
     return BC_PHOTO
 
-
-# ── BC_PHOTO ──
 
 async def bc_photo_received(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data["bc_photo"] = update.message.photo[-1].file_id
@@ -420,8 +531,6 @@ async def bc_photo_skip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     return BC_BTN_TEXT
 
 
-# ── BC_BTN_TEXT ──
-
 async def bc_btn_text_handler(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> int:
@@ -442,8 +551,6 @@ async def bc_btn_skip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
     return await show_preview(query.message.chat_id, context)
 
 
-# ── BC_BTN_URL ──
-
 async def bc_btn_url_handler(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> int:
@@ -462,7 +569,7 @@ async def show_preview(chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> int:
     btn_text = ud.get("bc_btn_text")
     btn_url = ud.get("bc_btn_url")
 
-    preview_parts = [f"📨 Предпросмотр рассылки:\n"]
+    preview_parts = ["📨 Предпросмотр рассылки:\n"]
     preview_parts.append(f"📝 Текст: {text[:200]}{'…' if len(text) > 200 else ''}")
     preview_parts.append(f"🖼 Фото: {'Да' if photo else 'Нет'}")
     if btn_text:
@@ -482,8 +589,6 @@ async def show_preview(chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> int:
     )
     return BC_CONFIRM
 
-
-# ── BC_CONFIRM ──
 
 async def bc_confirm_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
@@ -520,7 +625,6 @@ async def bc_confirm_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
             continue
 
         bots_used += 1
-
         final_url = btn_url or referral_link
         final_btn_text = btn_text or "🚀 Подключить VPN"
         keyboard = [[InlineKeyboardButton(final_btn_text, url=final_url)]]
@@ -532,10 +636,8 @@ async def bc_confirm_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
             try:
                 if photo:
                     await app.bot.send_photo(
-                        chat_id=user_id,
-                        photo=photo,
-                        caption=text,
-                        reply_markup=markup,
+                        chat_id=user_id, photo=photo,
+                        caption=text, reply_markup=markup,
                     )
                 else:
                     await app.bot.send_message(
@@ -651,6 +753,9 @@ def build_app(
         entry_points=[CommandHandler("admin", admin_cmd)],
         states={
             MENU: [CallbackQueryHandler(menu_cb)],
+            ADD_BOT_TOKEN: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, add_bot_token_handler),
+            ],
             BC_TEXT: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, bc_text_handler),
             ],
@@ -683,6 +788,8 @@ def webhook_path(token: str) -> str:
 # ── Main ──────────────────────────────────────────────────────────────
 
 async def run() -> None:
+    global webhook_domain, next_bot_number
+
     port = int(os.getenv("PORT", "8080"))
     domain = os.getenv("RAILWAY_PUBLIC_DOMAIN") or os.getenv("WEBHOOK_DOMAIN")
 
@@ -697,6 +804,7 @@ async def run() -> None:
         logger.error("Set DATABASE_URL env var")
         return
 
+    webhook_domain = domain
     await init_db()
 
     default_link = os.getenv(
@@ -704,11 +812,14 @@ async def run() -> None:
     )
 
     apps: dict[str, Application] = {}
+    used_tokens: set[str] = set()
 
+    # Load from env
     for i in range(1, 301):
         token = os.getenv(f"BOT_TOKEN_{i}")
         if not token:
             continue
+        used_tokens.add(token)
         referral_link = os.getenv(f"REFERRAL_LINK_{i}", default_link)
         bot_desc = os.getenv(f"BOT_DESCRIPTION_{i}", BOT_DESCRIPTION)
         bot_short_desc = os.getenv(f"BOT_SHORT_DESCRIPTION_{i}", BOT_SHORT_DESCRIPTION)
@@ -717,12 +828,30 @@ async def run() -> None:
         app = build_app(token, referral_link, bot_desc, bot_short_desc)
         app.bot_data["bot_number"] = i
         apps[path] = app
-        logger.info("Bot %d configured -> %s (token ...%s)", i, path, token[-6:])
+        next_bot_number = max(next_bot_number, i + 1)
+        logger.info("Bot %d configured from env (token ...%s)", i, token[-6:])
+
+    # Load from DB (tokens added via admin panel)
+    db_tokens = await get_db_bot_tokens()
+    for row in db_tokens:
+        token = row["token"]
+        if token in used_tokens:
+            continue
+        used_tokens.add(token)
+        referral_link = row["referral_link"] or default_link
+        path = webhook_path(token)
+        app = build_app(token, referral_link, BOT_DESCRIPTION, BOT_SHORT_DESCRIPTION)
+        num = next_bot_number
+        next_bot_number += 1
+        app.bot_data["bot_number"] = num
+        apps[path] = app
+        logger.info("Bot %d configured from DB (token ...%s)", num, token[-6:])
 
     if not apps:
-        logger.error("No bot tokens found. Set BOT_TOKEN_1 .. BOT_TOKEN_300 env vars.")
+        logger.error("No bot tokens found in env or DB.")
         return
 
+    # Initialize bots in parallel batches
     INIT_BATCH = 10
 
     async def init_bot(path: str, app: Application) -> str | None:
@@ -735,13 +864,13 @@ async def run() -> None:
                     BotCommand("start", "🚀 Подключить VPN"),
                 ]),
             )
-            webhook_url = f"https://{domain}{path}"
+            wh_url = f"https://{domain}{path}"
             await app.bot.set_webhook(
-                url=webhook_url,
+                url=wh_url,
                 allowed_updates=["message", "callback_query"],
                 drop_pending_updates=True,
             )
-            logger.info("Webhook set: %s", webhook_url)
+            logger.info("Webhook set: %s", wh_url)
             bot_numbers[app.bot.id] = app.bot_data["bot_number"]
             username = app.bot.username or ""
             bot_usernames[app.bot.id] = f"@{username}" if username else "—"
@@ -764,6 +893,7 @@ async def run() -> None:
 
     all_apps.update(apps)
 
+    # Wildcard webhook route — supports dynamically added bots
     async def handle_webhook(request: web.Request) -> web.Response:
         p = request.path
         app = all_apps.get(p)
@@ -782,8 +912,7 @@ async def run() -> None:
 
     http_app = web.Application()
     http_app.router.add_get("/", handle_health)
-    for path in all_apps:
-        http_app.router.add_post(path, handle_webhook)
+    http_app.router.add_post("/webhook/{token_hash}", handle_webhook)
 
     runner = web.AppRunner(http_app)
     await runner.setup()
