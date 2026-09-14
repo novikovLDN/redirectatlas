@@ -10,6 +10,7 @@ from collections import defaultdict
 import asyncpg
 from aiohttp import web
 from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.error import BadRequest, Forbidden, RetryAfter, TelegramError
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -41,6 +42,15 @@ def parse_admin_ids() -> set[int]:
 
 ADMIN_IDS: set[int] = parse_admin_ids()
 
+# Maximum number of bots served by this process (env BOT_TOKEN_1..BOT_TOKEN_400)
+MAX_BOTS = int(os.getenv("MAX_BOTS", "400"))
+# How many bots are initialized (webhook + profile) in parallel on boot
+INIT_BATCH = int(os.getenv("INIT_BATCH", "20"))
+# How many bots broadcast in parallel (each bot has its own Telegram rate limit)
+BROADCAST_CONCURRENCY = int(os.getenv("BROADCAST_CONCURRENCY", "25"))
+# Pause between two messages sent by the same bot (~25 msg/s per bot)
+SEND_DELAY = float(os.getenv("SEND_DELAY", "0.04"))
+
 all_apps: dict[str, Application] = {}
 bot_numbers: dict[int, int] = {}
 bot_usernames: dict[int, str] = {}
@@ -48,6 +58,19 @@ bot_links: dict[int, str] = {}
 db_pool: asyncpg.Pool | None = None
 webhook_domain: str = ""
 next_bot_number: int = 1
+
+# Guards against two broadcasts (manual or automatic) running at once
+broadcast_running: bool = False
+background_tasks: set[asyncio.Task] = set()
+
+
+def spawn_task(coro) -> asyncio.Task:
+    """Run a coroutine in the background and keep a strong reference to it."""
+    task = asyncio.create_task(coro)
+    background_tasks.add(task)
+    task.add_done_callback(background_tasks.discard)
+    return task
+
 
 RATE_LIMIT = 10
 RATE_WINDOW = 60
@@ -61,13 +84,18 @@ rate_limits: dict[tuple[int, int], list[float]] = defaultdict(list)
     BC_BTN_URL,
     BC_CONFIRM,
     ADD_BOT_TOKEN,
-) = range(7)
+    AUTO_BC_CONFIRM,
+) = range(8)
 
 # ── Database ──────────────────────────────────────────────────────────
 
 async def init_db() -> None:
     global db_pool
-    db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=5, max_size=20)
+    db_pool = await asyncpg.create_pool(
+        DATABASE_URL,
+        min_size=int(os.getenv("DB_POOL_MIN", "5")),
+        max_size=int(os.getenv("DB_POOL_MAX", "40")),
+    )
     async with db_pool.acquire() as conn:
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS users (
@@ -198,9 +226,17 @@ async def delete_bot_token(token: str) -> None:
 
 # ── Rate limiting ─────────────────────────────────────────────────────
 
+def prune_rate_limits(now: float) -> None:
+    stale = [k for k, v in rate_limits.items() if not v or now - v[-1] > RATE_WINDOW]
+    for k in stale:
+        del rate_limits[k]
+
+
 def check_rate_limit(bot_id: int, user_id: int) -> bool:
     key = (bot_id, user_id)
     now = time.time()
+    if len(rate_limits) > 50_000:
+        prune_rate_limits(now)
     rate_limits[key] = [t for t in rate_limits[key] if now - t < RATE_WINDOW]
     if len(rate_limits[key]) >= RATE_LIMIT:
         return False
@@ -252,6 +288,52 @@ AUTO_BROADCAST_TEXT = (
 AUTO_BROADCAST_INTERVAL = int(os.getenv("AUTO_BROADCAST_DAYS", "7")) * 86400
 
 
+# ── Links ─────────────────────────────────────────────────────────────
+
+FALLBACK_REFERRAL_LINK = "https://t.me/atlassecure_bot?start=ref_UEGJ3A"
+
+DEFAULT_BUTTON_TEXT = "🚀 Подключить VPN"
+
+# Button shown under the "we are moving to a new bot" broadcast
+AUTO_BROADCAST_BUTTON_TEXT = os.getenv(
+    "AUTO_BROADCAST_BUTTON_TEXT", "🚀 Перейти в новый бот"
+)
+
+
+def normalize_url(url: str | None) -> str | None:
+    """Return a URL Telegram accepts in an inline button, or None if unusable."""
+    url = (url or "").strip()
+    if not url or " " in url or "\n" in url:
+        return None
+    low = url.lower()
+    if low.startswith(("https://", "http://", "tg://")):
+        return url
+    if low.startswith("@") and len(url) > 1:
+        return "https://t.me/" + url[1:]
+    if low.startswith(("t.me/", "telegram.me/", "www.")):
+        return "https://" + url
+    if "." in url and "/" not in url.split(".")[0]:
+        return "https://" + url
+    return None
+
+
+def default_referral_link() -> str:
+    """Referral link used when a bot has no personal one."""
+    return (
+        normalize_url(os.getenv("DEFAULT_REFERRAL_LINK"))
+        or FALLBACK_REFERRAL_LINK
+    )
+
+
+def referral_link_of(bot_data: dict) -> str:
+    """Always returns a valid URL, so the inline button never breaks a send."""
+    return normalize_url(bot_data.get("referral_link")) or default_referral_link()
+
+
+def link_markup(text: str, url: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[InlineKeyboardButton(text, url=url)]])
+
+
 # ── Handlers ──────────────────────────────────────────────────────────
 
 async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -265,12 +347,10 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await save_user(bot_id, user_id)
     except Exception:
         logger.exception("DB error saving user %d for bot %d", user_id, bot_id)
-    referral_link = context.bot_data.get(
-        "referral_link", "https://t.me/atlassecure_bot?start=ref_UEGJ3A"
-    )
-    keyboard = [[InlineKeyboardButton("🚀 Подключить VPN", url=referral_link)]]
+    referral_link = referral_link_of(context.bot_data)
     await update.message.reply_text(
-        MESSAGE_TEXT, reply_markup=InlineKeyboardMarkup(keyboard)
+        MESSAGE_TEXT,
+        reply_markup=link_markup(DEFAULT_BUTTON_TEXT, referral_link),
     )
 
 
@@ -326,13 +406,14 @@ async def admin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     auto_info = await format_auto_broadcast_info()
     keyboard = [
         [InlineKeyboardButton("📨 Рассылка", callback_data="broadcast")],
+        [InlineKeyboardButton("🚀 Сделать рассылку «Переезд»", callback_data="auto_bc")],
         [InlineKeyboardButton("📊 Статистика", callback_data="stats")],
         [InlineKeyboardButton("➕ Добавить бота", callback_data="add_bot")],
         [InlineKeyboardButton("❌ Закрыть", callback_data="close")],
     ]
     await update.message.reply_text(
         f"🔐 Админ-панель\n\n"
-        f"🤖 Ботов: {len(all_apps)}\n"
+        f"🤖 Ботов: {len(all_apps)} / {MAX_BOTS}\n"
         f"👥 Всего: {dyn['total']}  |  "
         f"📅 +{dyn['today']}  |  "
         f"📆 +{dyn['week']}  |  "
@@ -355,6 +436,34 @@ async def menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
             "/cancel — отмена"
         )
         return BC_TEXT
+
+    if query.data == "auto_bc":
+        if broadcast_running:
+            await query.edit_message_text(
+                "⏳ Рассылка уже выполняется. Дождитесь отчёта и попробуйте снова."
+            )
+            return ConversationHandler.END
+        referral_link = referral_link_of(context.bot_data)
+        keyboard = [
+            # Real button — exactly what users will receive, tappable for a check
+            [InlineKeyboardButton(AUTO_BROADCAST_BUTTON_TEXT, url=referral_link)],
+            [InlineKeyboardButton("✅ Отправить всем", callback_data="auto_bc_go")],
+            [InlineKeyboardButton("❌ Отмена", callback_data="cancel")],
+        ]
+        await query.edit_message_text(
+            f"🚀 Рассылка «Переезжаем в новый бот»\n"
+            f"{'─' * 30}\n"
+            f"{AUTO_BROADCAST_TEXT}\n"
+            f"{'─' * 30}\n"
+            f"🔘 Кнопка: «{AUTO_BROADCAST_BUTTON_TEXT}»\n"
+            f"🔗 Ссылка: реф-ссылка каждого бота\n"
+            f"   (в этом боте: {referral_link})\n"
+            f"🤖 Ботов: {len(all_apps)}\n\n"
+            f"После отправки отсчёт авто-рассылки начнётся заново.",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            disable_web_page_preview=True,
+        )
+        return AUTO_BC_CONFIRM
 
     if query.data == "add_bot":
         await query.edit_message_text(
@@ -406,12 +515,40 @@ async def menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
             current += entry
         if current:
             chunks.append(current)
-        await query.edit_message_text(chunks[0])
+        await query.edit_message_text(chunks[0], disable_web_page_preview=True)
         for chunk in chunks[1:]:
-            await query.message.reply_text(chunk)
+            await query.message.reply_text(chunk, disable_web_page_preview=True)
+            await asyncio.sleep(0.1)
         return ConversationHandler.END
 
     await query.edit_message_text("Админ-панель закрыта.")
+    return ConversationHandler.END
+
+
+# ── Move broadcast: manual trigger from the admin panel ──
+
+async def auto_bc_confirm_cb(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> int:
+    query = update.callback_query
+    await query.answer()
+
+    if query.data != "auto_bc_go":
+        await query.edit_message_text("❌ Рассылка отменена.")
+        return ConversationHandler.END
+
+    if broadcast_running:
+        await query.edit_message_text("⏳ Рассылка уже выполняется.")
+        return ConversationHandler.END
+
+    await query.edit_message_text(
+        f"⏳ Рассылка «Переезд» запущена по {len(all_apps)} ботам.\n"
+        f"Отчёт придёт сюда по завершении."
+    )
+    # In the background: a webhook update must not wait for the whole broadcast
+    spawn_task(
+        run_auto_broadcast(manual_by=query.from_user.id, notify_bot=context.bot)
+    )
     return ConversationHandler.END
 
 
@@ -434,11 +571,16 @@ async def add_bot_token_handler(
         await update.message.reply_text("⚠️ Этот бот уже добавлен и активен.")
         return ConversationHandler.END
 
+    if len(all_apps) >= MAX_BOTS:
+        await update.message.reply_text(
+            f"❌ Достигнут лимит в {MAX_BOTS} ботов.\n"
+            f"Увеличьте переменную MAX_BOTS, чтобы добавить больше."
+        )
+        return ConversationHandler.END
+
     await update.message.reply_text("⏳ Проверяю токен...")
 
-    default_link = os.getenv(
-        "DEFAULT_REFERRAL_LINK", "https://t.me/atlassecure_bot?start=ref_UEGJ3A"
-    )
+    default_link = default_referral_link()
 
     try:
         app = build_app(token, default_link, BOT_DESCRIPTION, BOT_SHORT_DESCRIPTION)
@@ -554,11 +696,18 @@ async def bc_btn_skip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
 async def bc_btn_url_handler(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> int:
-    url = update.message.text.strip()
-    if url.lower() == "реф":
+    raw = update.message.text.strip()
+    if raw.lower() == "реф":
         context.user_data["bc_btn_url"] = None
-    else:
-        context.user_data["bc_btn_url"] = url
+        return await show_preview(update.message.chat_id, context)
+    url = normalize_url(raw)
+    if not url:
+        await update.message.reply_text(
+            "❌ Неверная ссылка. Пример: https://t.me/mybot?start=ref_ABC\n"
+            "Отправьте ссылку ещё раз, «реф» — реф-ссылка бота, /cancel — отмена."
+        )
+        return BC_BTN_URL
+    context.user_data["bc_btn_url"] = url
     return await show_preview(update.message.chat_id, context)
 
 
@@ -578,7 +727,10 @@ async def show_preview(chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> int:
     else:
         preview_parts.append("🔘 Кнопка: «🚀 Подключить VPN» → реф-ссылка бота")
 
+    preview_url = btn_url or referral_link_of(context.bot_data)
     keyboard = [
+        # Real button — the admin can tap it to verify the link works
+        [InlineKeyboardButton(btn_text or DEFAULT_BUTTON_TEXT, url=preview_url)],
         [InlineKeyboardButton("✅ Отправить всем", callback_data="confirm")],
         [InlineKeyboardButton("❌ Отмена", callback_data="cancel")],
     ]
@@ -586,11 +738,13 @@ async def show_preview(chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> int:
         chat_id=chat_id,
         text="\n".join(preview_parts),
         reply_markup=InlineKeyboardMarkup(keyboard),
+        disable_web_page_preview=True,
     )
     return BC_CONFIRM
 
 
 async def bc_confirm_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    global broadcast_running
     query = update.callback_query
     await query.answer()
 
@@ -609,54 +763,54 @@ async def bc_confirm_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         await query.edit_message_text("❌ Текст рассылки не найден.")
         return ConversationHandler.END
 
-    await query.edit_message_text("⏳ Рассылка запущена...")
-
-    total_sent = 0
-    total_failed = 0
-    bots_used = 0
-
-    for _path, app in all_apps.items():
-        bot_id = app.bot.id
-        referral_link = app.bot_data.get(
-            "referral_link", "https://t.me/atlassecure_bot?start=ref_UEGJ3A"
+    if broadcast_running:
+        await query.edit_message_text(
+            "⏳ Другая рассылка уже выполняется. Дождитесь отчёта."
         )
-        users = await get_users_for_bot(bot_id)
-        if not users:
-            continue
+        return ConversationHandler.END
 
-        bots_used += 1
-        final_url = btn_url or referral_link
-        final_btn_text = btn_text or "🚀 Подключить VPN"
-        keyboard = [[InlineKeyboardButton(final_btn_text, url=final_url)]]
-        markup = InlineKeyboardMarkup(keyboard)
-
-        for user_id in users:
-            if user_id in ADMIN_IDS:
-                continue
-            try:
-                if photo:
-                    await app.bot.send_photo(
-                        chat_id=user_id, photo=photo,
-                        caption=text, reply_markup=markup,
-                    )
-                else:
-                    await app.bot.send_message(
-                        chat_id=user_id, text=text, reply_markup=markup
-                    )
-                total_sent += 1
-            except Exception:
-                total_failed += 1
-            await asyncio.sleep(0.04)
-
-    await context.bot.send_message(
-        chat_id=query.from_user.id,
-        text=(
-            f"✅ Рассылка завершена!\n\n"
-            f"📨 Отправлено: {total_sent}\n"
-            f"❌ Не доставлено: {total_failed}\n"
-            f"🤖 Ботов: {bots_used}"
-        ),
+    await query.edit_message_text(
+        f"⏳ Рассылка запущена по {len(all_apps)} ботам.\n"
+        f"Отчёт придёт сюда по завершении."
     )
+
+    admin_id = query.from_user.id
+    bot = context.bot
+
+    async def worker() -> None:
+        global broadcast_running
+        broadcast_running = True
+        started = time.time()
+        try:
+            totals = await broadcast_to_all(
+                text=text,
+                photo=photo,
+                btn_text=btn_text,
+                btn_url=btn_url,
+                skip_admins=True,
+            )
+        except Exception:
+            logger.exception("Broadcast failed")
+            totals = {"sent": 0, "failed": 0, "bots": 0}
+        finally:
+            broadcast_running = False
+        try:
+            await bot.send_message(
+                chat_id=admin_id,
+                text=(
+                    f"✅ Рассылка завершена!\n\n"
+                    f"📨 Отправлено: {totals['sent']}\n"
+                    f"❌ Не доставлено: {totals['failed']}\n"
+                    f"🤖 Ботов: {totals['bots']}\n"
+                    f"⏱ Заняло: {(time.time() - started) / 60:.1f} мин"
+                ),
+            )
+        except Exception:
+            logger.exception("Cannot deliver broadcast report to admin %d", admin_id)
+
+    # Background task: the webhook request must return immediately, otherwise
+    # Telegram retries the callback and the broadcast would start twice.
+    spawn_task(worker())
     clear_bc(context)
     return ConversationHandler.END
 
@@ -665,6 +819,91 @@ async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     clear_bc(context)
     await update.message.reply_text("Отменено.")
     return ConversationHandler.END
+
+
+# ── Broadcast engine ──────────────────────────────────────────────────
+
+async def send_one(
+    bot, user_id: int, text: str, photo: str | None, markup: InlineKeyboardMarkup
+) -> bool:
+    """Send a single broadcast message, honouring Telegram flood control."""
+    for _attempt in range(3):
+        try:
+            if photo:
+                await bot.send_photo(
+                    chat_id=user_id, photo=photo, caption=text, reply_markup=markup
+                )
+            else:
+                await bot.send_message(
+                    chat_id=user_id, text=text, reply_markup=markup
+                )
+            return True
+        except RetryAfter as exc:
+            wait = min(float(getattr(exc, "retry_after", 5)) + 1, 60)
+            await asyncio.sleep(wait)
+        except (Forbidden, BadRequest):
+            return False  # blocked bot / deleted account — no point retrying
+        except TelegramError:
+            await asyncio.sleep(1)
+        except Exception:
+            return False
+    return False
+
+
+async def broadcast_to_all(
+    text: str,
+    photo: str | None = None,
+    btn_text: str | None = None,
+    btn_url: str | None = None,
+    skip_admins: bool = False,
+) -> dict:
+    """Send a message from every running bot to all of its users.
+
+    Bots work in parallel (each one has its own Telegram rate limit), which
+    keeps a 400-bot broadcast within a reasonable time window.
+    When btn_url is empty, each bot uses its own referral link.
+    """
+    apps = list(all_apps.values())
+    if not apps:
+        return {"sent": 0, "failed": 0, "bots": 0}
+
+    final_btn_text = (btn_text or DEFAULT_BUTTON_TEXT).strip() or DEFAULT_BUTTON_TEXT
+    fixed_url = normalize_url(btn_url)
+    semaphore = asyncio.Semaphore(max(1, BROADCAST_CONCURRENCY))
+    totals = {"sent": 0, "failed": 0, "bots": 0}
+
+    async def run_for_bot(app: Application) -> None:
+        async with semaphore:
+            bot_id = app.bot.id
+            try:
+                users = await get_users_for_bot(bot_id)
+            except Exception:
+                logger.exception("Broadcast: cannot load users for bot %d", bot_id)
+                return
+            if not users:
+                return
+            # Per-bot referral link unless the admin supplied an explicit URL
+            url = fixed_url or referral_link_of(app.bot_data)
+            markup = link_markup(final_btn_text, url)
+            sent = failed = 0
+            for user_id in users:
+                if skip_admins and user_id in ADMIN_IDS:
+                    continue
+                if await send_one(app.bot, user_id, text, photo, markup):
+                    sent += 1
+                else:
+                    failed += 1
+                await asyncio.sleep(SEND_DELAY)
+            totals["sent"] += sent
+            totals["failed"] += failed
+            totals["bots"] += 1
+            logger.info(
+                "Broadcast via bot #%s: sent=%d failed=%d",
+                bot_numbers.get(bot_id, "?"), sent, failed,
+            )
+
+    await asyncio.gather(*(run_for_bot(app) for app in apps))
+    return totals
 
 
 # ── Auto broadcast ────────────────────────────────────────────────────
@@ -683,7 +922,13 @@ async def auto_broadcast_loop() -> None:
                     )
                     await asyncio.sleep(remaining)
                     continue
-            await run_auto_broadcast()
+            result = await run_auto_broadcast()
+            if result.get("busy"):
+                # a manual broadcast is in progress — retry a bit later
+                await asyncio.sleep(300)
+            else:
+                # safety pause so an empty run can never spin the loop
+                await asyncio.sleep(60)
         except asyncio.CancelledError:
             return
         except Exception as exc:
@@ -691,52 +936,63 @@ async def auto_broadcast_loop() -> None:
             await asyncio.sleep(3600)
 
 
-async def run_auto_broadcast() -> None:
+async def run_auto_broadcast(
+    manual_by: int | None = None, notify_bot=None
+) -> dict:
+    """Send the "we are moving to a new bot" broadcast to every user.
+
+    Runs on a timer and can also be launched from the admin panel
+    (manual_by = admin user id). Either way the 7-day timer is reset, so
+    users never receive the same message twice in a row.
+    """
+    global broadcast_running
+
     if not all_apps:
-        return
-    total_sent = 0
-    total_failed = 0
-    for _path, app in all_apps.items():
-        bot_id = app.bot.id
-        referral_link = app.bot_data.get(
-            "referral_link", "https://t.me/atlassecure_bot?start=ref_UEGJ3A"
+        return {"sent": 0, "failed": 0, "bots": 0}
+    if broadcast_running:
+        logger.warning("Auto broadcast skipped: another broadcast is running")
+        return {"sent": 0, "failed": 0, "bots": 0, "busy": True}
+
+    broadcast_running = True
+    started = time.time()
+    try:
+        totals = await broadcast_to_all(
+            text=AUTO_BROADCAST_TEXT,
+            btn_text=AUTO_BROADCAST_BUTTON_TEXT,
+            btn_url=None,  # each bot links to its own referral link
         )
-        users = await get_users_for_bot(bot_id)
-        if not users:
-            continue
-        keyboard = [[InlineKeyboardButton("🚀 Подключиться", url=referral_link)]]
-        markup = InlineKeyboardMarkup(keyboard)
-        for user_id in users:
-            try:
-                await app.bot.send_message(
-                    chat_id=user_id, text=AUTO_BROADCAST_TEXT, reply_markup=markup
-                )
-                total_sent += 1
-            except Exception:
-                total_failed += 1
-            await asyncio.sleep(0.04)
+    finally:
+        broadcast_running = False
+
     now = time.time()
     await set_last_auto_broadcast(now)
-    logger.info("Auto broadcast done: sent=%d, failed=%d", total_sent, total_failed)
-    if ADMIN_IDS:
-        next_dt = datetime.datetime.fromtimestamp(
-            now + AUTO_BROADCAST_INTERVAL, tz=datetime.timezone.utc
-        )
-        first_app = next(iter(all_apps.values()), None)
-        if first_app:
-            for admin_id in ADMIN_IDS:
-                try:
-                    await first_app.bot.send_message(
-                        chat_id=admin_id,
-                        text=(
-                            f"🔄 Авто-рассылка завершена\n\n"
-                            f"📨 Отправлено: {total_sent}\n"
-                            f"❌ Не доставлено: {total_failed}\n\n"
-                            f"⏭ Следующая: {next_dt:%d.%m.%Y %H:%M} UTC"
-                        ),
-                    )
-                except Exception:
-                    pass
+    logger.info(
+        "Auto broadcast done (%s): sent=%d, failed=%d, bots=%d, %.1fs",
+        "manual" if manual_by else "scheduled",
+        totals["sent"], totals["failed"], totals["bots"], now - started,
+    )
+
+    next_dt = datetime.datetime.fromtimestamp(
+        now + AUTO_BROADCAST_INTERVAL, tz=datetime.timezone.utc
+    )
+    report = (
+        f"{'🚀 Рассылка «Переезд» отправлена' if manual_by else '🔄 Авто-рассылка завершена'}\n\n"
+        f"📨 Отправлено: {totals['sent']}\n"
+        f"❌ Не доставлено: {totals['failed']}\n"
+        f"🤖 Ботов: {totals['bots']}\n"
+        f"⏱ Заняло: {(now - started) / 60:.1f} мин\n\n"
+        f"⏭ Следующая авто-рассылка: {next_dt:%d.%m.%Y %H:%M} UTC"
+    )
+    sender = notify_bot or next(
+        (app.bot for app in all_apps.values()), None
+    )
+    if sender:
+        for admin_id in ADMIN_IDS:
+            try:
+                await sender.send_message(chat_id=admin_id, text=report)
+            except Exception:
+                pass
+    return totals
 
 
 # ── App builder ───────────────────────────────────────────────────────
@@ -771,6 +1027,11 @@ def build_app(
                 MessageHandler(filters.TEXT & ~filters.COMMAND, bc_btn_url_handler),
             ],
             BC_CONFIRM: [CallbackQueryHandler(bc_confirm_cb)],
+            AUTO_BC_CONFIRM: [
+                CallbackQueryHandler(
+                    auto_bc_confirm_cb, pattern=r"^(auto_bc_go|cancel)$"
+                ),
+            ],
         },
         fallbacks=[CommandHandler("cancel", cancel_cmd)],
     )
@@ -807,15 +1068,13 @@ async def run() -> None:
     webhook_domain = domain
     await init_db()
 
-    default_link = os.getenv(
-        "DEFAULT_REFERRAL_LINK", "https://t.me/atlassecure_bot?start=ref_UEGJ3A"
-    )
+    default_link = default_referral_link()
 
     apps: dict[str, Application] = {}
     used_tokens: set[str] = set()
 
-    # Load from env
-    for i in range(1, 301):
+    # Load from env: BOT_TOKEN_1 .. BOT_TOKEN_400
+    for i in range(1, MAX_BOTS + 1):
         token = os.getenv(f"BOT_TOKEN_{i}")
         if not token:
             continue
@@ -852,8 +1111,6 @@ async def run() -> None:
         return
 
     # Initialize bots in parallel batches
-    INIT_BATCH = 10
-
     async def init_bot(path: str, app: Application) -> str | None:
         try:
             await app.initialize()
@@ -920,8 +1177,8 @@ async def run() -> None:
     await site.start()
 
     logger.info(
-        "Started %d bot(s) on port %d. Admins: %s",
-        len(all_apps), port, ADMIN_IDS or "not set",
+        "Started %d/%d bot(s) on port %d. Admins: %s",
+        len(all_apps), MAX_BOTS, port, ADMIN_IDS or "not set",
     )
 
     broadcast_task = asyncio.create_task(auto_broadcast_loop())
